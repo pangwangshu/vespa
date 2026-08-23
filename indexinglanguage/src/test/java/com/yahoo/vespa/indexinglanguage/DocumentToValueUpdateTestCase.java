@@ -30,6 +30,13 @@ import com.yahoo.tensor.Tensor;
 import com.yahoo.tensor.TensorType;
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
@@ -363,6 +370,41 @@ public class DocumentToValueUpdateTestCase {
         assertNotNull(valueUpd = fieldUpd.getValueUpdate(0));
         assertTrue(valueUpd instanceof RemoveValueUpdate);
         assertEquals(new StringFieldValue("bar"), valueUpd.getValue());
+    }
+
+    // Reproduces https://github.com/vespa-engine/vespa/issues/37627: an indexing expression (e.g. embed())
+    // that derives a tensor from an array field being partially updated (e.g. an array "add") cannot itself
+    // be incrementally added to, since the produced value is a single tensor, not a collection. Instead of
+    // silently dropping the update as before, this must now be logged so the gap is observable.
+    @Test
+    public void requireThatUnrepresentableAddIsSkippedButLogged() {
+        DocumentType docType = new DocumentType("my_type");
+        docType.addField(new Field("my_tensor", DataType.getTensor(TensorType.fromSpec("tensor(x[2])"))));
+
+        ValueUpdate valueUpd = ValueUpdate.createAdd(new StringFieldValue("foo"));
+        Document doc = FieldUpdateHelper.newPartialDocument(docType, null, docType.getField("my_tensor"), valueUpd);
+        // Simulate an indexing expression (e.g. embed()) having produced a whole-tensor value for this field.
+        doc.setFieldValue("my_tensor", new TensorFieldValue(Tensor.from("tensor(x[2])", "[1,2]")));
+
+        List<LogRecord> logged = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override public void publish(LogRecord record) { logged.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        Logger logger = Logger.getLogger(FieldUpdateFieldValues.class.getName());
+        logger.addHandler(handler);
+        try {
+            UpdateFieldValues adapter = FieldUpdateFieldValues.fromPartialUpdate(new SimpleDocumentFieldValues(null, doc), valueUpd);
+            DocumentUpdate docUpd = adapter.getOutput();
+            assertNull(docUpd); // Still not representable as a document update: nothing is silently corrupted.
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertEquals(1, logged.size());
+        assertEquals(Level.WARNING, logged.get(0).getLevel());
+        assertTrue(logged.get(0).getMessage().contains("my_tensor"));
     }
 
     private static class TensorFixture {

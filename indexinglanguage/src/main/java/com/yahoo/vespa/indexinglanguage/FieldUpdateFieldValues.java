@@ -31,12 +31,16 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * @author Simon Thoresen Hult
  */
 @SuppressWarnings("rawtypes")
 public class FieldUpdateFieldValues implements UpdateFieldValues {
+
+    private static final Logger logger = Logger.getLogger(FieldUpdateFieldValues.class.getName());
 
     private final DocumentFieldValues values;
     private final Builder builder;
@@ -57,7 +61,7 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
             Field field = entry.getKey();
             if (field.getName().equals("sddocname")) continue;
             FieldUpdate fieldUpdate = FieldUpdate.create(field);
-            fieldUpdate.addValueUpdates(builder.build(entry.getValue()));
+            fieldUpdate.addValueUpdates(builder.build(field, entry.getValue()));
             if (!fieldUpdate.isEmpty()) {
                 update.addFieldUpdate(fieldUpdate);
             }
@@ -105,7 +109,7 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
 
     private interface Builder {
 
-        List<ValueUpdate> build(FieldValue val);
+        List<ValueUpdate> build(Field field, FieldValue val);
     }
 
     private static class PartialBuilder implements Builder {
@@ -117,12 +121,12 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
         }
 
         @Override
-        public List<ValueUpdate> build(FieldValue val) {
-            return createValueUpdates(val, update);
+        public List<ValueUpdate> build(Field field, FieldValue val) {
+            return createValueUpdates(field, val, update);
         }
 
         @SuppressWarnings({ "unchecked" })
-        List<ValueUpdate> createValueUpdates(FieldValue value, ValueUpdate update) {
+        List<ValueUpdate> createValueUpdates(Field field, FieldValue value, ValueUpdate update) {
             List<ValueUpdate> valueUpdates = new ArrayList<>();
             if (update instanceof ClearValueUpdate) {
                 valueUpdates.add(new ClearValueUpdate());
@@ -134,7 +138,7 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
                 } else if (value instanceof WeightedSet) {
                     valueUpdates.addAll(createAddValueUpdateForWset((WeightedSet)value));
                 } else {
-                    // do nothing
+                    warnIncrementalUpdateSkipped(field, value, update);
                 }
             } else if (update instanceof ArithmeticValueUpdate) {
                 valueUpdates.add(update); // leave arithmetics alone
@@ -144,19 +148,19 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
                 } else if (value instanceof WeightedSet) {
                     valueUpdates.addAll(createRemoveValueUpdateForEachElement(((WeightedSet)value).fieldValueIterator()));
                 } else {
-                    // do nothing
+                    warnIncrementalUpdateSkipped(field, value, update);
                 }
             } else if (update instanceof MapValueUpdate) {
                 if (value instanceof Array) {
-                    valueUpdates.addAll(createMapValueUpdatesForArray((Array)value, (MapValueUpdate)update));
+                    valueUpdates.addAll(createMapValueUpdatesForArray(field, (Array)value, (MapValueUpdate)update));
                 } else if (value instanceof MapFieldValue) {
                     throw new UnsupportedOperationException("Can not map into a " + value.getClass().getName());
                 } else if (value instanceof StructuredFieldValue) {
-                    valueUpdates.addAll(createMapValueUpdatesForStruct((StructuredFieldValue)value, (MapValueUpdate)update));
+                    valueUpdates.addAll(createMapValueUpdatesForStruct(field, (StructuredFieldValue)value, (MapValueUpdate)update));
                 } else if (value instanceof WeightedSet) {
-                    valueUpdates.addAll(createMapValueUpdatesForWset((WeightedSet)value, (MapValueUpdate)update));
+                    valueUpdates.addAll(createMapValueUpdatesForWset(field, (WeightedSet)value, (MapValueUpdate)update));
                 } else {
-                    // do nothing
+                    warnIncrementalUpdateSkipped(field, value, update);
                 }
             } else if (update instanceof TensorModifyUpdate) {
                 valueUpdates.add(update);
@@ -199,11 +203,11 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
         }
 
         @SuppressWarnings({ "unchecked" })
-        private List<ValueUpdate> createMapValueUpdatesForArray(Array arr, MapValueUpdate upd) {
+        private List<ValueUpdate> createMapValueUpdatesForArray(Field field, Array arr, MapValueUpdate upd) {
             List<ValueUpdate> ret = new ArrayList<>();
             for (Iterator<FieldValue> it = arr.fieldValueIterator(); it.hasNext();) {
                 FieldValue childVal = it.next();
-                for (ValueUpdate childUpd : createValueUpdates(childVal, upd.getUpdate())) {
+                for (ValueUpdate childUpd : createValueUpdates(field, childVal, upd.getUpdate())) {
                     // The array update is always directed towards a particular array index, which is
                     // kept as the _value_ in the original update.
                     ret.add(new MapValueUpdate(upd.getValue(), childUpd));
@@ -212,11 +216,11 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
             return ret;
         }
 
-        private List<ValueUpdate> createMapValueUpdatesForStruct(StructuredFieldValue struct, MapValueUpdate upd) {
+        private List<ValueUpdate> createMapValueUpdatesForStruct(Field field, StructuredFieldValue struct, MapValueUpdate upd) {
             List<ValueUpdate> ret = new ArrayList<>();
             for (Iterator<Map.Entry<Field, FieldValue>> it = struct.iterator(); it.hasNext();) {
                 Map.Entry<Field, FieldValue> entry = it.next();
-                for (ValueUpdate childUpd : createValueUpdates(entry.getValue(), upd.getUpdate())) {
+                for (ValueUpdate childUpd : createValueUpdates(field, entry.getValue(), upd.getUpdate())) {
                     ret.add(new MapValueUpdate(new StringFieldValue(entry.getKey().getName()), childUpd));
                 }
             }
@@ -224,17 +228,25 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
         }
 
         @SuppressWarnings({ "unchecked" })
-        private List<ValueUpdate> createMapValueUpdatesForWset(WeightedSet wset, MapValueUpdate upd) {
+        private List<ValueUpdate> createMapValueUpdatesForWset(Field field, WeightedSet wset, MapValueUpdate upd) {
             List<ValueUpdate> ret = new ArrayList<>();
             for (Iterator<FieldValue> it = wset.fieldValueIterator(); it.hasNext();) {
                 FieldValue childVal = it.next();
-                for (ValueUpdate childUpd : createValueUpdates(new IntegerFieldValue(wset.get(childVal)),
+                for (ValueUpdate childUpd : createValueUpdates(field, new IntegerFieldValue(wset.get(childVal)),
                                                                upd.getUpdate()))
                 {
                     ret.add(new MapValueUpdate(childVal, childUpd));
                 }
             }
             return ret;
+        }
+
+        private void warnIncrementalUpdateSkipped(Field field, FieldValue value, ValueUpdate update) {
+            logger.log(Level.WARNING,
+                       "Indexing expression for field '" + field.getName() + "' produced a " +
+                       value.getClass().getSimpleName() + " value, which cannot be derived incrementally " +
+                       "from a " + update.getClass().getSimpleName() + ". The update to '" + field.getName() +
+                       "' was skipped; send a full document put or an assign update to recompute it.");
         }
     }
 
@@ -247,8 +259,8 @@ public class FieldUpdateFieldValues implements UpdateFieldValues {
         }
 
         @Override
-        List<ValueUpdate> createValueUpdates(FieldValue value, ValueUpdate upd) {
-            return super.createValueUpdates(value, nullAssign);
+        List<ValueUpdate> createValueUpdates(Field field, FieldValue value, ValueUpdate upd) {
+            return super.createValueUpdates(field, value, nullAssign);
         }
     }
 
